@@ -1,45 +1,72 @@
-import logging
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+from app.core.config import APP_CONFIG
 
-logger = logging.getLogger(__name__)
 
-class LLMClient:
-    """Simulates Gemma 4. Replace with real API later."""
-    def __init__(self, model_name: str = "gemma-4"):
-        self.model_name = model_name
+class GemmaClient:
+    """
+    Loads Google Gemma 4 on Kaggle T4 GPU using 4-bit quantization.
+    Falls back to smaller model if primary fails.
+    """
 
-    def generate(self, system_prompt: str, user_message: str, history=None) -> str:
-        return _placeholder_response(user_message)
+    def __init__(self):
+        self.model = None
+        self.tokenizer = None
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self._load_model()
 
-def _placeholder_response(user_input: str) -> str:
-    text = user_input.lower().strip()
-    # Strict correction
-    if "sun revolves around earth" in text:
-        return _build_response(
-            explanation="Aap ka statement galt hai. Actually, Earth revolves around the Sun. Yeh heliocentric model hai.",
-            example="Maano aap gol chakkar laga rahe ho centre ke ird gird. Centre Sun hai, aap Earth.",
-            diagram="       (Sun)\n         /|\\\n        / | \\\n   (Earth)----> orbit",
-            question="Agar Sun itna heavy hai, toh Earth usme kyun nahi gir jaati?",
+    def _load_model(self):
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16,
         )
-    if "2+2=5" in text.replace(" ", ""):
-        return _build_response(
-            explanation="Nahi, 2+2=4 hota hai. Basic addition seekho.",
-            example="2 apples + 2 apples = 4 apples.",
-            diagram="+---+---+\n| 2 | 2 |\n+---+---+\n  \\   /\n   4",
-            question="3+3 kitna hota hai?",
-        )
-    if "photosynthesis" in text:
-        return _build_response(
-            explanation="Plants sunlight se khana banate hain. CO₂ + H₂O + light → Glucose + O₂",
-            example="Dhoop mein rakha podha acha grow karta hai.",
-            diagram="       ☀️\n        |\n      [Leaf]\n   CO₂+H₂O → Glucose+O₂",
-            question="Agar plant ko pani na mile toh photosynthesis ruk jayega?",
-        )
-    return _build_response(
-        explanation=f"Aap ne '{user_input[:50]}...' ke baare mein poocha. Chaliye zero level se samjhte hain.",
-        example="Real-life example sochiye...",
-        diagram="+------------------+\n|   Core Concept   |\n+------------------+\n        |\n        v\n  [Application]",
-        question="Is topic ka sab se ahem point kya hai?",
-    )
 
-def _build_response(explanation, example, diagram, question):
-    return f"Explanation:\n{explanation}\n\nExample:\n{example}\n\nDiagram:\n{diagram}\n\nQuick Question:\n{question}"
+        for model_id in [APP_CONFIG["model_primary"], APP_CONFIG["model_fallback"]]:
+            try:
+                print(f"[GemmaClient] Loading: {model_id}")
+                self.tokenizer = AutoTokenizer.from_pretrained(model_id)
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    model_id,
+                    quantization_config=bnb_config,
+                    device_map="auto",
+                    torch_dtype=torch.bfloat16,
+                    low_cpu_mem_usage=True,
+                )
+                print(f"[GemmaClient] ✅ Loaded: {model_id}")
+                return
+            except Exception as e:
+                print(f"[GemmaClient] ❌ Failed {model_id}: {e}")
+                continue
+
+        raise RuntimeError("Both Gemma 4 models failed to load. Check GPU memory and internet.")
+
+    def generate(self, prompt: str, max_new_tokens: int = None) -> str:
+        if self.model is None:
+            raise RuntimeError("Model not loaded.")
+
+        max_tokens = max_new_tokens or APP_CONFIG["max_new_tokens"]
+
+        inputs = self.tokenizer(
+            prompt,
+            return_tensors="pt",
+            truncation=True,
+            max_length=2048,
+        ).to(self.device)
+
+        with torch.no_grad():
+            outputs = self.model.generate(
+                **inputs,
+                max_new_tokens=max_tokens,
+                temperature=APP_CONFIG["temperature"],
+                top_p=APP_CONFIG["top_p"],
+                do_sample=True,
+                pad_token_id=self.tokenizer.eos_token_id,
+                repetition_penalty=1.1,
+            )
+
+        # Decode only NEW tokens
+        new_tokens = outputs[0][inputs["input_ids"].shape[1]:]
+        return self.tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+        
