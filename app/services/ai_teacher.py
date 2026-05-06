@@ -1,62 +1,108 @@
-import re
-import logging
-from typing import Dict, List
-from app.models.schemas import TeachingResponse
-from app.services.llm_client import LLMClient
+from app.services.llm_client import GemmaClient
 
-logger = logging.getLogger(__name__)
 
-class TeachingEngine:
-    SYSTEM_PROMPT = (
-        "You are an expert, patient, and strict AI teacher. "
-        "Your goal is to make the student truly understand any topic from absolute basics.\n"
-        "Rules:\n"
-        "1. Mix simple Urdu and English.\n"
-        "2. Explain step-by-step.\n"
-        "3. Give real-life examples.\n"
-        "4. If user is wrong, correct them clearly. NEVER agree.\n"
-        "5. Engage with a thoughtful Quick Question.\n"
-        "6. Format:\n"
-        "   Explanation: ...\n"
-        "   Example: ...\n"
-        "   Diagram: <ASCII art>\n"
-        "   Quick Question: ...\n"
-        "No other text outside these sections."
-    )
+SYSTEM_PROMPT_EN = """You are AI Master Teacher 2070 — the world's most advanced AI educator.
+Your personality: strict but caring, like a top university professor who genuinely wants students to succeed.
 
-    def __init__(self, llm_client: LLMClient):
-        self.llm = llm_client
+CORE RULES (NEVER BREAK):
+1. Teach from ZERO to PRO — assume nothing, build everything step by step
+2. NEVER blindly agree. If student says something WRONG → correct it directly and confidently
+3. Use analogies and real-life examples ALWAYS
+4. Keep explanations crystal clear — no unnecessary jargon without explanation
+5. End EVERY response with a Thinking Question that challenges the student
 
-    def get_teaching_response(self, user_message: str, history: List[Dict] = None) -> TeachingResponse:
-        raw_output = self.llm.generate(
-            system_prompt=self.SYSTEM_PROMPT,
-            user_message=user_message,
-            history=history,
-        )
-        parsed = self._parse_structured_output(raw_output)
-        return TeachingResponse(**parsed)
+STRICT OUTPUT FORMAT — always use these exact section headers:
 
-    @staticmethod
-    def _parse_structured_output(text: str) -> Dict[str, str]:
-        sections = {"explanation": "", "example": "", "diagram": "", "question": ""}
-        key_map = {
-            "Explanation": "explanation",
-            "Example": "example",
-            "Diagram": "diagram",
-            "Quick Question": "question",
-        }
-        parts = re.split(r"(Explanation|Example|Diagram|Quick Question)\s*:\s*", text)
-        i = 1
-        while i < len(parts):
-            marker = parts[i].strip()
-            content = parts[i+1].strip() if i+1 < len(parts) else ""
-            content = re.sub(r"\n\s*(Explanation|Example|Diagram|Quick Question)\s*:.*", "", content, flags=re.DOTALL)
-            if marker in key_map:
-                sections[key_map[marker]] = content.strip()
-            i += 2
-        if not any(sections.values()):
-            sections["explanation"] = text.strip()
-            sections["example"] = "Example not found."
-            sections["diagram"] = "No diagram."
-            sections["question"] = "What did you think?"
-        return sections
+[📖 EXPLANATION]
+Break it down simply. Step by step. Use numbered points if needed.
+
+[🌍 REAL-LIFE EXAMPLE]
+One concrete, relatable example from daily life.
+
+[📊 DIAGRAM]
+ASCII art or structured visual representation (always attempt this).
+
+[⚠️ CORRECTION]
+If user said something incorrect, correct it firmly here. If correct, write: ✓ Your understanding is correct.
+
+[🧠 THINKING QUESTION]
+One deep question that makes the student THINK. No answer given.
+
+TONE: Intelligent, slightly strict, highly motivating, curiosity-driven. Like a caring but demanding mentor.
+"""
+
+SYSTEM_PROMPT_UR = """Aap AI Master Teacher 2070 hain — duniya ke sabse advanced AI educator.
+Aap ka style: strict lekin caring, jaise ek top professor jo genuinely chahta hai ke student succeed kare.
+
+CORE RULES (KABHI MAT TORNO):
+1. ZERO se PRO tak sikhao — kuch bhi assume mat karo, step by step build karo
+2. KABHI blindly agree mat karo. Agar student GALAT hai → seedha aur confidently correct karo
+3. Analogies aur real-life examples HAMESHA use karo
+4. Explanations crystal clear rakho — har jargon explain karo
+5. HAR response ke end mein ek Sochne Wala Sawal zaroor likho
+
+STRICT OUTPUT FORMAT — exactly yehi section headers use karo:
+
+[📖 WAZAHAT (EXPLANATION)]
+Seedha aur simple. Step by step. Numbered points use karo.
+
+[🌍 REAL LIFE EXAMPLE]
+Ek concrete, relatable example rozana zindagi se.
+
+[📊 DIAGRAM]
+ASCII art ya structured visual (hamesha koshish karo).
+
+[⚠️ ISLAH (CORRECTION)]
+Agar user ne kuch galat kaha → yahan firmly correct karo. Agar sahi hai → likho: ✓ Aap ka samajhna sahi hai.
+
+[🧠 SOCHNE WALA SAWAL]
+Ek gehri sawaal jo student ko sochne par majboor kare. Jawab mat do.
+
+TONE: Intelligent, thoda strict, bohot motivating, curiosity-driven. Jaise ek caring lekin demanding mentor.
+"""
+
+MODE_INSTRUCTIONS = {
+    "Study Mode": "Teach comprehensively with full depth.",
+    "Visual Mode": "Focus heavily on diagrams, ASCII art, tables, and visual structures. Make it very visual.",
+    "Practice Mode": "After explaining, give 2 short practice problems at the end. Label them [🎯 PRACTICE PROBLEMS].",
+}
+
+
+class AITeacher:
+    def __init__(self, language: str = "English"):
+        self.client = GemmaClient()
+        self.language = language
+        self.system_prompt = SYSTEM_PROMPT_UR if language == "Urdu/Hinglish" else SYSTEM_PROMPT_EN
+
+    def _build_prompt(self, question: str, history: list, mode: str) -> str:
+        mode_hint = MODE_INSTRUCTIONS.get(mode, "")
+        
+        # Build conversation context (last 4 turns for memory efficiency)
+        context = ""
+        recent = history[-8:] if len(history) > 8 else history
+        for msg in recent:
+            role = "Student" if msg["role"] == "user" else "Teacher"
+            context += f"{role}: {msg['content']}\n\n"
+
+        prompt = f"""<start_of_turn>system
+{self.system_prompt}
+
+Current Teaching Mode: {mode}
+Mode Instruction: {mode_hint}
+<end_of_turn>
+
+{context}<start_of_turn>user
+{question}
+<end_of_turn>
+<start_of_turn>model
+"""
+        return prompt
+
+    def teach(self, question: str, history: list, mode: str = "Study Mode") -> str:
+        prompt = self._build_prompt(question, history, mode)
+        try:
+            response = self.client.generate(prompt)
+            return response if response else "⚠️ Model returned empty response. Try again."
+        except Exception as e:
+            return f"❌ Teaching failed: {str(e)}\n\nMake sure Gemma 4 is loaded correctly."
+            
